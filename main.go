@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"domain_scanner/internal/generator"
+	"domain_scanner/internal/stats"
 	"domain_scanner/internal/types"
 	"domain_scanner/internal/worker"
 )
@@ -194,6 +195,11 @@ func main() {
 		fmt.Printf("Using regex filter: %s\n", *regexFilter)
 	}
 
+	// 创建统计收集器和状态渲染器
+	collector := stats.NewCollector(int64(estimatedDomains), *workers)
+	renderer := stats.NewStatusRenderer(collector)
+	renderer.Start()
+
 	// Create channels for jobs and results
 	jobs := make(chan string, 1000)
 	results := make(chan types.DomainResult, 1000)
@@ -204,7 +210,7 @@ func main() {
 		workerWg.Add(1)
 		go func(id int) {
 			defer workerWg.Done()
-			worker.Worker(id, jobs, results, time.Duration(*delay)*time.Millisecond)
+			worker.Worker(id, jobs, results, time.Duration(*delay)*time.Millisecond, collector)
 		}(w)
 	}
 
@@ -216,40 +222,40 @@ func main() {
 		}
 	}()
 
-	// Create a channel for domain status messages
-	statusChan := make(chan string, 1000)
-
-	// Start a goroutine to print status messages
-	go func() {
-		for msg := range statusChan {
-			fmt.Println(msg)
-		}
-	}()
-
 	// Collect results
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		processedCount := 0
+		isTTY := renderer.IsTTY()
 		for result := range results {
-			processedCount++
-			progress := fmt.Sprintf("[%d]", processedCount)
+			collector.IncrementProcessed()
+
 			if result.Error != nil {
-				statusChan <- fmt.Sprintf("%s Error checking domain %s: %v", progress, result.Domain, result.Error)
+				// 错误情况在终端模式下不显示，避免干扰状态栏
+				if !isTTY {
+					fmt.Printf("[ERROR] %s: %v\n", result.Domain, result.Error)
+				}
 				continue
 			}
 
 			if result.Available {
-				statusChan <- fmt.Sprintf("%s Domain %s is AVAILABLE!", progress, result.Domain)
+				collector.IncrementAvailable()
 				availableDomains = append(availableDomains, result.Domain)
+				// 打印可用域名
+				if isTTY {
+					fmt.Printf("\r\033[K[FOUND] %s is AVAILABLE!\n", result.Domain)
+				} else {
+					fmt.Printf("[FOUND] %s is AVAILABLE!\n", result.Domain)
+				}
 			} else if *showRegistered {
 				sigStr := strings.Join(result.Signatures, ", ")
-				statusChan <- fmt.Sprintf("%s Domain %s is REGISTERED [%s]", progress, result.Domain, sigStr)
 				registeredDomains = append(registeredDomains, result.Domain)
+				if !isTTY {
+					fmt.Printf("[REG] %s [%s]\n", result.Domain, sigStr)
+				}
 			}
 		}
-		close(statusChan)
 	}()
 
 	// 监控任务完成 - 等待所有worker完成后关闭results
@@ -262,6 +268,9 @@ func main() {
 	}()
 
 	wg.Wait()
+
+	// 停止状态渲染器
+	renderer.Stop()
 
 	// Save available domains to file
 	availableFile := fmt.Sprintf("available_domains_%s_%d_%s.txt", *pattern, *length, strings.TrimPrefix(*suffix, "."))
